@@ -18,41 +18,47 @@ import (
 )
 
 var (
-	// ErrLeaseHeld means another controller holds the lease on a pod.
-	ErrLeaseHeld = errors.New("runtime: lease held by another owner")
-	// ErrLeaseExpired means the lease existed but its TTL lapsed before use.
-	ErrLeaseExpired = errors.New("runtime: lease expired")
 	// ErrNoPodAvailable means the pool is empty and cannot scale fast enough
-	// to satisfy the request before its own deadline.
+	// to satisfy the request before its own deadline. Implementations return
+	// this rather than blocking indefinitely, so the orchestrator retains
+	// control of backpressure and re-queueing.
 	ErrNoPodAvailable = errors.New("runtime: no pod available")
+	// ErrPodLost means the pod vanished mid-execution. Classified as
+	// retryable: the work did not fail, the infrastructure did.
+	ErrPodLost = errors.New("runtime: pod lost")
+	// ErrSlotUnavailable means the pod is alive but already at its
+	// concurrency budget.
+	ErrSlotUnavailable = errors.New("runtime: pod at capacity")
 )
 
-// Lease is exclusive, time-bounded ownership of a single runner pod.
+// PodHandle is a reference to a registered runner pod and the slot reserved on
+// it.
 //
-// Fencing is the point. If the orchestrator crashes after acquiring a lease,
-// that lease must not stay held forever: it expires on its own and another
-// orchestrator can take the pod. The FencingToken increases on every
-// acquisition, so a result produced under an older token can be detected as
-// stale and discarded (see Phase 6).
-type Lease struct {
-	Pod          string        `json:"pod"`
-	LeaseID      string        `json:"leaseId"`
-	FencingToken int64         `json:"fencingToken"`
-	AcquiredAt   time.Time     `json:"acquiredAt"`
-	TTL          time.Duration `json:"ttl"`
+// This replaces the lease-with-monotonic-fencing-token design of the original
+// Phase 0. The reason is in ADR 0003: fencing is derived from
+// (attempt, pod_id) in the database rather than from a counter that must be
+// allocated and kept consistent. Pod liveness is carried by heartbeats rather
+// than by lease TTL, because a TTL cannot distinguish a slow pod from a dead
+// one.
+type PodHandle struct {
+	PodID   string `json:"podId"`
+	PodName string `json:"podName"`
+	Node    string `json:"node"`
+	// Slot is the concurrency slot reserved on this pod, in [0, Slots).
+	Slot  int `json:"slot"`
+	Slots int `json:"slots"`
 }
 
-// Valid reports whether the lease is still within its TTL.
-func (l Lease) Valid(now time.Time) bool {
-	return now.Sub(l.AcquiredAt) < l.TTL
-}
+// Available reports whether the handle refers to a live pod with capacity.
+func (h PodHandle) Available() bool { return h.Slot >= 0 && h.Slot < h.Slots }
 
 // ExecResult is the outcome of one attempt as observed by the runtime.
 //
 // Note what is *absent*: there is no field for "is this result still
-// relevant". Freshness is decided by the orchestrator comparing FencingToken,
-// not by the pod. A pod that was evicted and came back must not be able to
-// resurrect a stale result by virtue of being alive.
+// relevant". Freshness is decided by the orchestrator comparing Attempt and
+// PodID against the row (see domain.Fence), not by the pod. A pod that was
+// evicted and came back must not be able to resurrect a stale result by
+// virtue of being alive.
 type ExecResult struct {
 	Pod       string
 	Node      string
@@ -97,12 +103,12 @@ type Request struct {
 	StepSpec domain.StepSpec
 	// RunEnv is merged beneath StepSpec.Env. Step-level wins.
 	RunEnv map[string]string
-	// AttemptID and FencingToken are injected into the container environment
-	// so user code can deduplicate its own side effects (at-least-once
-	// delivery is all we can offer; idempotency is the user's job, and we
-	// make it possible).
-	AttemptID    string
-	FencingToken int64
+	// AttemptID and Attempt are injected into the container environment so
+	// user code can deduplicate its own side effects (at-least-once delivery
+	// is all we can offer; idempotency is the user's job, and we make it
+	// possible). Attempt also forms half of the fence — see ADR 0003.
+	AttemptID string
+	Attempt   int
 	// Timeout bounds this single attempt.
 	Timeout time.Duration
 	// MaxLogBytes bounds captured stdout/stderr. Output is truncated with a
@@ -118,14 +124,23 @@ type PodInfo struct {
 	Ready bool
 	// Phase is the Kubernetes pod phase string.
 	Phase string
-	// LeaseOwner and LeaseExpiry reflect the control-plane lease, which is
-	// authoritative over pod state. A pod may be Running while unleased.
-	LeaseOwner  string    `json:"leaseOwner,omitempty"`
-	LeaseExpiry time.Time `json:"leaseExpiry,omitempty"`
-	Leased      bool      `json:"leased"`
+	// LastHeartbeat is the control-plane view of pod liveness. This is
+	// authoritative over the Kubernetes phase: a pod can be Running and
+	// still be wedged, or Pending for reasons the API will not explain.
+	LastHeartbeat time.Time `json:"lastHeartbeat"`
+	Slots         int       `json:"slots"`
+	ActiveSteps   int       `json:"activeSteps"`
 }
 
+// Idle reports whether the pod has a free concurrency slot.
+func (p PodInfo) Idle() bool { return p.Ready && p.ActiveSteps < p.Slots }
+
 // Runtime executes steps. Implementations must be safe for concurrent use.
+//
+// Architecture follows the reference implementation's worker model: pods are
+// registered and heartbeat (mirroring its `workers` table), work is claimed
+// from Postgres with SKIP LOCKED (mirroring PollTasks), and a pod that stops
+// heartbeating has its work evicted (mirroring PollTasksOnInactiveWorkers).
 //
 // Contract for all implementations:
 //
@@ -135,32 +150,35 @@ type PodInfo struct {
 //     within a bounded time after either fires, so the watchdog is never the
 //     only thing preventing a hung step.
 //   - Cleanup must fully reset the pod: kill stray processes, clear the work
-//     directory. A step must not be able to affect the step that leases the
+//     directory. A step must not be able to affect the step that occupies the
 //     pod next. This is the price of a warm pool over pod-per-step.
 //   - Heartbeat answers "is this pod still worth waiting for", nothing more.
-//     A live pod proves liveness, not progress; see the watchdog design.
+//     A live pod proves liveness, not progress; a step wedged in user code
+//     will heartbeat forever. See RunnerPod.IsStale.
 type Runtime interface {
-	// Acquire leases an idle pod, waiting at most until ctx or deadline.
-	Acquire(ctx context.Context, owner string, ttl time.Duration) (Lease, error)
+	// Register adds a pod to the pool and begins heartbeating on its behalf.
+	Register(ctx context.Context, pod domain.RunnerPod) error
 
-	// Renew extends an existing lease. Returns ErrLeaseExpired if the lease
-	// was already lost, which tells the orchestrator its work is orphaned.
-	Renew(ctx context.Context, lease Lease, ttl time.Duration) (Lease, error)
+	// Acquire reserves a concurrency slot on a healthy pod, waiting at most
+	// until ctx or its own deadline.
+	Acquire(ctx context.Context, deadline time.Time) (PodHandle, error)
 
-	// Release returns a pod to the pool. Cleanup is performed before the pod
-	// is marked idle, so a failed Cleanup keeps the pod out of circulation
-	// rather than poisoning the next tenant.
-	Release(ctx context.Context, lease Lease, cleanErr error) error
+	// Release returns a slot, performing cleanup first. If cleanup fails the
+	// slot is not returned to circulation: a pod we could not scrub must not
+	// be handed to the next step.
+	Release(ctx context.Context, handle PodHandle, cleanErr error) error
 
-	// Exec runs the step's command inside the leased pod. It must return
+	// Exec runs the step's command inside the pod. It must return
 	// ExecResult even when the step failed; Err in the result signals that
 	// the infrastructure failed, not the command.
-	Exec(ctx context.Context, lease Lease, req Request) (ExecResult, error)
+	Exec(ctx context.Context, handle PodHandle, req Request) (ExecResult, error)
 
-	// Heartbeat reports whether the pod backing a lease is still alive.
-	Heartbeat(ctx context.Context, lease Lease) error
+	// Heartbeat reports whether the pod is still alive. Called by the
+	// watchdog sweep; a nil return within InactivityThreshold keeps the
+	// pod's steps alive.
+	Heartbeat(ctx context.Context, podID string) error
 
-	// List returns the current pool, leased and idle.
+	// List returns the current pool, with liveness and capacity.
 	List(ctx context.Context) ([]PodInfo, error)
 
 	// Scale grows the pool toward targetIdle idle pods.

@@ -15,7 +15,6 @@ set -euo pipefail
 CLUSTER="${KIND_CLUSTER:-kubedag}"
 NAMESPACE="${NAMESPACE:-kubedag}"
 RUNNER_IMAGE="${RUNNER_IMAGE:-kubedag-runner:v0}"
-REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16-alpine}"
 INFRA_ONLY=0
 
@@ -63,12 +62,6 @@ fi
 # Phase 9 target this stack without hardcoding names.
 kubectl label namespace "$NAMESPACE" kubedag.dev/stack=local --overwrite >/dev/null
 
-# --- redis -------------------------------------------------------------------
-# Deployed as a single-node StatefulSet rather than a plain Deployment so that
-# PVC-backed persistence is possible later without changing the manifest shape.
-log "deploying redis"
-kubectl -n "$NAMESPACE" apply -f deploy/infra/redis.yaml
-
 # --- postgres ----------------------------------------------------------------
 log "deploying postgres"
 kubectl -n "$NAMESPACE" apply -f deploy/infra/postgres.yaml
@@ -90,8 +83,7 @@ kubectl -n "$NAMESPACE" delete statefulset "${RUNNER_IMAGE%%:*}-pool" --ignore-n
 kubectl -n "$NAMESPACE" apply -f deploy/runner/runner-pool.yaml
 
 # --- wait for readiness ------------------------------------------------------
-log "waiting for redis and postgres"
-kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=180s
+log "waiting for postgres"
 kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
 
 log "waiting for runner pods"
@@ -104,7 +96,6 @@ kubectl -n "$NAMESPACE" rollout status statefulset/runner-pool --timeout=300s
 log "establishing port-forwards (127.0.0.1 -> cluster)"
 pkill -f "kubectl port-forward -n $NAMESPACE" 2>/dev/null || true
 
-kubectl -n "$NAMESPACE" port-forward svc/redis    6379:6379  >/tmp/kubedag-redis-pf.log    2>&1 &
 kubectl -n "$NAMESPACE" port-forward svc/postgres 5432:5432  >/tmp/kubedag-postgres-pf.log 2>&1 &
 kubectl -n "$NAMESPACE" port-forward svc/orchestrator 8080:8080 >/tmp/kubedag-api-pf.log     2>&1 &
 
@@ -131,7 +122,6 @@ $(printf '\033[1;32mstack is up\033[0m')
 
   cluster     $CLUSTER
   namespace   $NAMESPACE
-  redis       127.0.0.1:6379
   postgres    127.0.0.1:5432 (kubedag/kubedag)
   api         http://127.0.0.1:8080
 

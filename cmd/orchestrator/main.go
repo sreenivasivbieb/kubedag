@@ -83,7 +83,7 @@ func routes() http.Handler {
 	mux := http.NewServeMux()
 
 	// healthz: liveness. Answers "is this process wedged?", so it must not
-	// depend on Redis or Postgres — otherwise a queue blip restarts every
+	// depend on Postgres — otherwise a database blip restarts every
 	// orchestrator in the cluster and turns a degradation into an outage.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -92,11 +92,12 @@ func routes() http.Handler {
 	})
 
 	// readyz: readiness. This one *should* check dependencies, and returning
-	// 503 removes the pod from the Service without killing it.
+	// 503 removes the pod from the Service without killing it. Postgres is
+	// the only dependency: per ADR 0001 there is no queue to check.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ready","checks":{"redis":"stub","postgres":"stub"}}`))
+		_, _ = w.Write([]byte(`{"status":"ready","checks":{"postgres":"stub"}}`))
 	})
 
 	return mux

@@ -8,43 +8,38 @@ across a warm pod pool, and driven to a terminal state no matter what fails.
 > CI, and a one-command local stack. The DAG engine, pod manager, persistence
 > and API land in Phases 1–12. Nothing here runs a step yet, by design.
 
----
-
 ## Architecture
+
+Grounded in
+[hatchet-dev/durable-execution-the-hard-way](https://github.com/hatchet-dev/durable-execution-the-hard-way)
+— a durable execution engine built on Postgres alone. We adopt its patterns
+rather than inventing new ones. See [ADRs](docs/adr/) for the reasoning.
 
 ```mermaid
 graph TB
-    subgraph CP["Control plane"]
-        API["HTTP API<br/>validate + persist"]
-        ORCH["Orchestrator<br/><i>sole writer of run/step state</i>"]
-        DAG["dag package<br/><b>pure, no I/O</b>"]
-        SM["state machine<br/><b>pure</b>"]
+    subgraph CP["Control plane — sole writer of run/step state"]
+        API["HTTP API<br/>validate (pure) + persist"]
+        ORCH["Orchestrator loop<br/>schedule · sweep · watchdog"]
+        DAG["dag package<br/><b>pure: validation, ready steps,<br/>skip propagation</b>"]
+        SM["state machine<br/><b>pure: transition table</b>"]
     end
 
-    subgraph Q["Redis"]
-        SQ[("step queue")]
-        RQ[("result queue")]
-    end
+    PG[("<b>PostgreSQL</b><br/>runs · steps · step_events<br/>runner_pods · attempts<br/><i>broker AND store AND event log</i>")]
 
-    subgraph DP["Data plane"]
+    subgraph DP["Data plane — reports observations, never decides meaning"]
         PM["Pod Manager"]
-        POOL["Pod Pool<br/>leases + expiry"]
-        RP[("runner pods<br/>StatefulSet")]
+        POOL["Pod Pool<br/>register + heartbeat + slots"]
+        RP[("runner pods<br/>StatefulSet, stable names")]
     end
-
-    PG[("PostgreSQL<br/>runs, steps,<br/>attempts, events")]
 
     API --> ORCH
     ORCH --> DAG
     ORCH --> SM
-    ORCH <--> PG
-    ORCH -->|"LPUSH step"| SQ
-    SQ -->|"BRPOP step"| PM
+    ORCH <-->|"claim: SKIP LOCKED<br/>report results"| PG
+    PM <-->|"register · heartbeat<br/>fenced writes"| PG
     PM --> POOL
-    POOL -->|"exec"| RP
-    PM -->|"LPUSH result"| RQ
-    RQ -->|"BRPOP result"| ORCH
-    PM -.->|"never writes"| PG
+    POOL -->|"exec + cleanup"| RP
+    PM -.->|"never writes run/step state"| ORCH
 
     classDef pure fill:#e8f5e9,stroke:#2e7d32
     classDef sole fill:#fff3e0,stroke:#ef6c00
@@ -52,10 +47,29 @@ graph TB
     class ORCH sole
 ```
 
-**The load-bearing rule:** only the Orchestrator mutates run and step state.
-The pod manager reports *observations* (`this command exited 137 on runner-2`);
-the orchestrator decides *meaning* (that makes the step `FAILED`). One writer
-means no distributed lock protocol for state transitions.
+**No Redis.** Postgres is the broker, the store, and the event log. Dequeue is
+a single statement with `FOR UPDATE SKIP LOCKED`, which makes "this step
+exists" and "this step is claimed" one atomic operation — there is no
+dual-write window. ([ADR 0001](docs/adr/0001-postgres-broker.md))
+
+### Patterns inherited from the reference implementation
+
+| Reference repo | kubedag |
+|---|---|
+| `PollTasks` (`SKIP LOCKED`) | claim ready steps |
+| `workers` + `last_heartbeat_at` | `runner_pods` registry |
+| `PollTasksOnInactiveWorkers` | evict steps off silent pods |
+| durable → `ReassignTask` / non-durable → `UpdateTaskFailed` | **kept as-is** ([ADR 0002](docs/adr/0002-evict-durable-retry-others.md)) |
+| `durable_events(task_id, event_id, kind, key, child_task_id)` | `step_events(run_id, step_id, event_id, kind, key)` |
+| `(task_id, retry_count, worker_id)` fence | `(run_id, step_id, attempt, pod_id)` fence ([ADR 0003](docs/adr/0003-state-derived-fencing.md)) |
+| `createKey` sha256 → `NonDeterminismErr` | identical |
+| sem / `len(w.sem)` → SQL `LIMIT` | per-run + global concurrency |
+| scheduling vs execution timeout | same distinction, same retry semantics |
+
+**One deliberate divergence:** the reference repo's `DurableContext.RunTask`
+lets a workflow invoke children *dynamically*. kubedag's DAG is declared up
+front, so there is no `RunTask` — the orchestrator computes readiness instead.
+The event log still earns its place for crash-resume.
 
 ---
 
@@ -71,9 +85,11 @@ internal/
   runtime/          Runtime interface: the Kubernetes seam
   config/           env-driven config with documented defaults
 deploy/
-  infra/            redis + postgres manifests
+  infra/            postgres manifests
   runner/           runner StatefulSet + runner Dockerfile
   kind/             kind cluster config
+docs/
+  adr/              decision log (ADR 0001-0003)
 scripts/
   dev-up.sh         one-command local stack
   dev-down.sh       teardown
@@ -82,7 +98,7 @@ scripts/
 ## Quickstart
 
 ```bash
-make dev-up     # kind + redis + postgres + runner pool + both binaries
+make dev-up     # kind + postgres + runner pool + both binaries
 curl -s localhost:8080/healthz
 curl -s localhost:8080/readyz
 make dev-down
@@ -112,7 +128,7 @@ make help      # all targets
 | 1 | Pure DAG: validation, ready-step computation, skip propagation | next |
 | 2 | State machine + transition table | |
 | 3 | Pod pool, leases, exec, cleanup between leases | |
-| 4 | Redis queues, pod manager, orchestrator loop, watchdog | |
+| 4 | Pod pool runtime, orchestrator loop, heartbeat watchdog | |
 | 5 | PostgreSQL persistence + migrations | |
 | 6 | Retries, backoff, fencing tokens, stale-result rejection | |
 | 7 | Reconciliation + crash recovery + failure injection | |
@@ -126,13 +142,23 @@ make help      # all targets
 
 Filled in as phases land. The headline commitments:
 
-- **At-least-once execution, never exactly-once.** A step may run more than
-  once after a crash. `ATTEMPT_ID` is injected into the environment so user
-  code can deduplicate; making retries safe is the user's responsibility.
-- **Terminal is final.** No transition out of `SUCCEEDED`/`FAILED`/`CANCELLED`
-  at either the run or step level.
-- **Deterministic termination.** Every run reaches a terminal state via
-  per-step timeout plus heartbeat watchdog.
+| Property | Guarantee | Mechanism |
+|---|---|---|
+| Delivery | at-least-once | `SKIP LOCKED` claim; eviction re-queues |
+| Exactly-once | **not provided** | see below |
+| Ordering | per-step FIFO | `ORDER BY id` within a run |
+| Idempotency | user-side only | `ATTEMPT_ID` injected into step env |
+| Fencing | `(attempt, pod_id)` | stale writes rejected, ADR 0003 |
+| Terminal | final | `SUCCEEDED`/`FAILED`/`CANCELLED` are absorbing |
+| Termination | deterministic | per-step timeout + heartbeat watchdog |
+
+**At-least-once, never exactly-once.** A step may run more than once after a
+crash or eviction. `ATTEMPT_ID` is injected so user code can deduplicate;
+making retries safe is the user's job. We do not pretend otherwise.
+
+**Heartbeat proves liveness, not progress.** A step wedged in an infinite loop
+inside a healthy pod will heartbeat forever. That is why the per-step timeout
+and the heartbeat watchdog are independent mechanisms, not one.
 
 ## Non-goals (v1)
 

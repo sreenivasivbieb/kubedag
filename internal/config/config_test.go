@@ -21,12 +21,10 @@ func TestLoadDefaults(t *testing.T) {
 		{"api addr", c.APIAddr, ":8080"},
 		{"namespace", c.Namespace, "kubedag"},
 		{"pool size", c.PoolSize, 5},
-		{"lease ttl", c.LeaseTTL, 60 * time.Second},
+		{"inactivity threshold", c.InactivityThreshold, 30 * time.Second},
 		{"heartbeat interval", c.HeartbeatInterval, 5 * time.Second},
 		{"global concurrency", c.GlobalMaxConcurrentSteps, 20},
 		{"per-run concurrency", c.PerRunMaxConcurrentSteps, 8},
-		{"step queue", c.StepQueue, "kubedag:steps"},
-		{"result queue", c.ResultQueue, "kubedag:results"},
 	}
 	for _, tc := range checks {
 		if tc.got != tc.want {
@@ -37,7 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadOverridesFromEnv(t *testing.T) {
 	t.Setenv("KUBEDAG_POOL_SIZE", "12")
-	t.Setenv("KUBEDAG_LEASE_TTL", "90s")
+	t.Setenv("KUBEDAG_INACTIVITY_THRESHOLD", "90s")
 	t.Setenv("KUBEDAG_NAMESPACE", "other")
 
 	c, err := Load(RoleOrchestrator)
@@ -47,8 +45,8 @@ func TestLoadOverridesFromEnv(t *testing.T) {
 	if c.PoolSize != 12 {
 		t.Errorf("PoolSize = %d, want 12", c.PoolSize)
 	}
-	if c.LeaseTTL != 90*time.Second {
-		t.Errorf("LeaseTTL = %s, want 90s", c.LeaseTTL)
+	if c.InactivityThreshold != 90*time.Second {
+		t.Errorf("InactivityThreshold = %s, want 90s", c.InactivityThreshold)
 	}
 	if c.Namespace != "other" {
 		t.Errorf("Namespace = %q, want %q", c.Namespace, "other")
@@ -60,7 +58,7 @@ func TestLoadOverridesFromEnv(t *testing.T) {
 // warning, not take the orchestrator down at boot.
 func TestLoadMalformedEnvFallsBackToDefault(t *testing.T) {
 	t.Setenv("KUBEDAG_POOL_SIZE", "not-a-number")
-	t.Setenv("KUBEDAG_LEASE_TTL", "not-a-duration")
+	t.Setenv("KUBEDAG_INACTIVITY_THRESHOLD", "not-a-duration")
 
 	c, err := Load(RoleOrchestrator)
 	if err != nil {
@@ -69,30 +67,41 @@ func TestLoadMalformedEnvFallsBackToDefault(t *testing.T) {
 	if c.PoolSize != 5 {
 		t.Errorf("PoolSize = %d, want default 5", c.PoolSize)
 	}
-	if c.LeaseTTL != 60*time.Second {
-		t.Errorf("LeaseTTL = %s, want default 60s", c.LeaseTTL)
+	if c.InactivityThreshold != 30*time.Second {
+		t.Errorf("InactivityThreshold = %s, want default 30s", c.InactivityThreshold)
 	}
 }
 
-// The lease/heartbeat relationship is a correctness property, not a taste
-// question: if a lease can expire while its holder is demonstrably alive, two
-// orchestrators can own the same pod and both exec into it.
-func TestValidateRejectsShortLeaseTTL(t *testing.T) {
-	t.Setenv("KUBEDAG_LEASE_TTL", "5s")
+// The inactivity-threshold/heartbeat relationship is a correctness property,
+// not a taste question: if the threshold is too close to the interval, one
+// delayed packet evicts a healthy pod and duplicates work.
+func TestValidateRejectsShortInactivityThreshold(t *testing.T) {
+	t.Setenv("KUBEDAG_INACTIVITY_THRESHOLD", "5s")
 	t.Setenv("KUBEDAG_HEARTBEAT_INTERVAL", "5s")
 
 	_, err := Load(RoleOrchestrator)
 	if err == nil {
-		t.Fatal("expected error: LeaseTTL must exceed 2x heartbeat interval")
+		t.Fatal("expected error: InactivityThreshold must exceed 2x heartbeat interval")
 	}
 }
 
-func TestValidateRejectsShortHeartbeatTimeout(t *testing.T) {
+func TestValidateRejectsFastStaleSweep(t *testing.T) {
 	t.Setenv("KUBEDAG_HEARTBEAT_INTERVAL", "10s")
-	t.Setenv("KUBEDAG_HEARTBEAT_TIMEOUT", "5s")
+	t.Setenv("KUBEDAG_STALE_POD_TICK_INTERVAL", "5s")
 
 	if _, err := Load(RoleOrchestrator); err == nil {
-		t.Fatal("expected error: HeartbeatTimeout must exceed heartbeat interval")
+		t.Fatal("expected error: stale sweep tick must be >= heartbeat interval")
+	}
+}
+
+// Schedule timeout must exceed execution timeout, otherwise a step can be
+// failed for being slow before it was ever picked up.
+func TestValidateRejectsShortScheduleTimeout(t *testing.T) {
+	t.Setenv("KUBEDAG_SCHEDULE_TIMEOUT", "10s")
+	t.Setenv("KUBEDAG_DEFAULT_STEP_TIMEOUT", "5m")
+
+	if _, err := Load(RoleOrchestrator); err == nil {
+		t.Fatal("expected error: schedule timeout must exceed default step timeout")
 	}
 }
 

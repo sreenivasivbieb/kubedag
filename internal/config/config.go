@@ -36,33 +36,36 @@ type Config struct {
 	// <prefix>-0, <prefix>-1, ...
 	RunnerPodPrefix string
 
-	// --- Pod pool ---
-	PoolSize          int
-	LeaseTTL          time.Duration
-	HeartbeatInterval time.Duration
-	// HeartbeatTimeout is how many consecutive missed heartbeats before a
-	// step is declared lost.
-	HeartbeatTimeout time.Duration
+	// --- Pod pool / registry ---
+	// Pool registration mirrors the reference implementation's `workers`
+	// table: pods announce themselves and heartbeat, and staleness is the
+	// eviction signal. See ADR 0003 for why this replaces lease-as-primary.
+	PoolSize int
+	// InactivityThreshold is how long a pod may go without a heartbeat
+	// before its steps are evicted. The reference repo uses 10s with a 5s
+	// tick; we default more conservatively and document the trade-off.
+	InactivityThreshold time.Duration
+	HeartbeatInterval   time.Duration
+	// StalePodTickInterval is how often the eviction sweep runs. Kept
+	// comfortably above HeartbeatInterval so a single slow heartbeat does
+	// not trigger eviction.
+	StalePodTickInterval time.Duration
+	// ScheduleTimeout bounds how long a step may sit QUEUED before failing
+	// without ever being attempted. Distinct from the execution timeout:
+	// schedule timeouts are non-retryable, execution timeouts are retryable.
+	ScheduleTimeout time.Duration
 
 	// --- Execution defaults ---
 	DefaultStepTimeout time.Duration
 	MaxLogBytes        int
 
 	// --- Concurrency ---
-	// GlobalMaxConcurrentSteps bounds steps in flight across all runs.
+	// These bound work in flight. The reference implementation uses a
+	// buffered-channel semaphore and passes (slots - len(sem)) into the
+	// dequeue LIMIT; we enforce the same bounds in SQL so that multiple
+	// orchestrator replicas cannot collectively exceed them.
 	GlobalMaxConcurrentSteps int
-	// PerRunMaxConcurrentSteps bounds steps in flight within one run.
 	PerRunMaxConcurrentSteps int
-
-	// --- Queue ---
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
-	StepQueue     string
-	ResultQueue   string
-	// QueuePollInterval is the orchestrator's idle tick. We BRPOP with a
-	// timeout rather than hot-looping.
-	QueuePollInterval time.Duration
 
 	// --- Store ---
 	DatabaseURL string
@@ -95,23 +98,17 @@ func Load(role string) (Config, error) {
 		RunnerImage:     env("KUBEDAG_RUNNER_IMAGE", "docker.io/library/busybox:1.36"),
 		RunnerPodPrefix: env("KUBEDAG_RUNNER_POD_PREFIX", "runner"),
 
-		PoolSize:          envInt("KUBEDAG_POOL_SIZE", 5),
-		LeaseTTL:          envDuration("KUBEDAG_LEASE_TTL", 60*time.Second),
-		HeartbeatInterval: envDuration("KUBEDAG_HEARTBEAT_INTERVAL", 5*time.Second),
-		HeartbeatTimeout:  envDuration("KUBEDAG_HEARTBEAT_TIMEOUT", 30*time.Second),
+		PoolSize:             envInt("KUBEDAG_POOL_SIZE", 5),
+		InactivityThreshold:  envDuration("KUBEDAG_INACTIVITY_THRESHOLD", 30*time.Second),
+		HeartbeatInterval:    envDuration("KUBEDAG_HEARTBEAT_INTERVAL", 5*time.Second),
+		StalePodTickInterval: envDuration("KUBEDAG_STALE_POD_TICK_INTERVAL", 10*time.Second),
+		ScheduleTimeout:      envDuration("KUBEDAG_SCHEDULE_TIMEOUT", 10*time.Minute),
 
 		DefaultStepTimeout: envDuration("KUBEDAG_DEFAULT_STEP_TIMEOUT", 5*time.Minute),
 		MaxLogBytes:        envInt("KUBEDAG_MAX_LOG_BYTES", 64*1024),
 
 		GlobalMaxConcurrentSteps: envInt("KUBEDAG_GLOBAL_MAX_CONCURRENT_STEPS", 20),
 		PerRunMaxConcurrentSteps: envInt("KUBEDAG_PER_RUN_MAX_CONCURRENT_STEPS", 8),
-
-		RedisAddr:         env("KUBEDAG_REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:     env("KUBEDAG_REDIS_PASSWORD", ""),
-		RedisDB:           envInt("KUBEDAG_REDIS_DB", 0),
-		StepQueue:         env("KUBEDAG_STEP_QUEUE", "kubedag:steps"),
-		ResultQueue:       env("KUBEDAG_RESULT_QUEUE", "kubedag:results"),
-		QueuePollInterval: envDuration("KUBEDAG_QUEUE_POLL_INTERVAL", time.Second),
 
 		DatabaseURL: env("KUBEDAG_DATABASE_URL", "postgres://kubedag:kubedag@127.0.0.1:5432/kubedag?sslmode=disable"),
 
@@ -133,16 +130,23 @@ func (c Config) validate() error {
 	if c.PoolSize < 1 {
 		return fmt.Errorf("config: KUBEDAG_POOL_SIZE must be >= 1, got %d", c.PoolSize)
 	}
-	// A lease must outlive at least two heartbeat intervals, otherwise a
-	// lease can expire while the holder is demonstrably alive, which would
-	// hand a live pod to two owners.
-	if c.LeaseTTL <= c.HeartbeatInterval*2 {
-		return fmt.Errorf("config: KUBEDAG_LEASE_TTL (%s) must exceed 2x KUBEDAG_HEARTBEAT_INTERVAL (%s)",
-			c.LeaseTTL, c.HeartbeatInterval)
+	// A pod must be able to miss several heartbeats before we declare it
+	// dead. If the threshold is too close to the interval, one delayed
+	// packet evicts a healthy pod and duplicates work.
+	if c.InactivityThreshold <= c.HeartbeatInterval*2 {
+		return fmt.Errorf("config: KUBEDAG_INACTIVITY_THRESHOLD (%s) must exceed 2x KUBEDAG_HEARTBEAT_INTERVAL (%s)",
+			c.InactivityThreshold, c.HeartbeatInterval)
 	}
-	if c.HeartbeatTimeout <= c.HeartbeatInterval {
-		return fmt.Errorf("config: KUBEDAG_HEARTBEAT_TIMEOUT (%s) must exceed KUBEDAG_HEARTBEAT_INTERVAL (%s)",
-			c.HeartbeatTimeout, c.HeartbeatInterval)
+	// The eviction sweep must be slow enough that a pod which heartbeated
+	// just before the sweep is not caught mid-interval.
+	if c.StalePodTickInterval < c.HeartbeatInterval {
+		return fmt.Errorf("config: KUBEDAG_STALE_POD_TICK_INTERVAL (%s) must be >= KUBEDAG_HEARTBEAT_INTERVAL (%s)",
+			c.StalePodTickInterval, c.HeartbeatInterval)
+	}
+	if c.ScheduleTimeout <= c.DefaultStepTimeout {
+		return fmt.Errorf("config: KUBEDAG_SCHEDULE_TIMEOUT (%s) must exceed KUBEDAG_DEFAULT_STEP_TIMEOUT (%s), "+
+			"otherwise a step can time out before it is ever picked up",
+			c.ScheduleTimeout, c.DefaultStepTimeout)
 	}
 	if c.PerRunMaxConcurrentSteps > c.GlobalMaxConcurrentSteps {
 		return fmt.Errorf("config: KUBEDAG_PER_RUN_MAX_CONCURRENT_STEPS (%d) exceeds KUBEDAG_GLOBAL_MAX_CONCURRENT_STEPS (%d)",

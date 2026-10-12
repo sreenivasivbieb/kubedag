@@ -50,7 +50,7 @@ func run() error {
 	slog.Info("starting podmanager",
 		"namespace", cfg.Namespace,
 		"pool_size", cfg.PoolSize,
-		"lease_ttl", cfg.LeaseTTL.String(),
+		"inactivity_threshold", cfg.InactivityThreshold.String(),
 	)
 
 	// The dequeue loop arrives in Phase 4.

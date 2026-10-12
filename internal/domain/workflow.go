@@ -153,18 +153,22 @@ func (s StepStatus) IsTerminal() bool {
 func (s StepStatus) IsSuccess() bool { return s == StepSucceeded }
 
 // Attempt records one physical execution of a step. A step with Retries=2 may
-// have up to three attempts, each with a distinct AttemptID and FencingToken.
+// have up to three attempts, each with a distinct AttemptID.
+//
+// Note there is no FencingToken counter. Freshness is determined by
+// (Attempt, PodID) against the step row — see Fence and ADR 0003. A separate
+// monotonic counter would need an allocator that stays consistent across
+// crashes, for no additional guarantee.
 type Attempt struct {
-	AttemptID    string     `json:"attemptId"`
-	FencingToken int64      `json:"fencingToken"`
-	Number       int        `json:"number"`
-	StartedAt    time.Time  `json:"startedAt"`
-	EndedAt      *time.Time `json:"endedAt,omitempty"`
-	Pod          string     `json:"pod,omitempty"`
-	Node         string     `json:"node,omitempty"`
-	ExitCode     *int       `json:"exitCode,omitempty"`
-	Outcome      StepStatus `json:"outcome"`
-	Error        string     `json:"error,omitempty"`
+	AttemptID string     `json:"attemptId"`
+	Number    int        `json:"number"`
+	StartedAt time.Time  `json:"startedAt"`
+	EndedAt   *time.Time `json:"endedAt,omitempty"`
+	Pod       string     `json:"pod,omitempty"`
+	Node      string     `json:"node,omitempty"`
+	ExitCode  *int       `json:"exitCode,omitempty"`
+	Outcome   StepStatus `json:"outcome"`
+	Error     string     `json:"error,omitempty"`
 	// Stdout and Stderr are trimmed and bounded by MaxLogBytes at write time.
 	Stdout string `json:"stdout,omitempty"`
 	Stderr string `json:"stderr,omitempty"`
