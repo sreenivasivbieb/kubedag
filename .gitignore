@@ -1,5 +1,5 @@
-bin/
+node_modules/
 .dev/
-coverage.out
-*.test
+coverage/
+*.log
 .DS_Store

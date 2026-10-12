@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    // Bun runs TypeScript directly; this config governs `tsc --noEmit` in CI,
+    // which is what catches type errors before a test run does.
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+
+    // Strictness. `noUncheckedIndexedAccess` is the one people skip and then
+    // regret: it forces handling of Record<string, X>[key] possibly being
+    // undefined, which is exactly the shape of step-state lookups.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

@@ -1,0 +1,31 @@
+{
+  "name": "kubedag",
+  "description": "DAG workflow orchestrator that runs each step in an isolated Kubernetes pod",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "lint": "tsc --noEmit",
+    "setup": "./scripts/setup.sh",
+    "teardown": "./scripts/teardown.sh"
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^1.4.0",
+    "express": "^5.2.1",
+    "ioredis": "^5.11.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.3",
+    "typescript": "^5.9.3"
+  }
+}

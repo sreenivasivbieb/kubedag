@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubedag-runner
+  labels:
+    kubedag.dev/stack: local
+    # Pod Security Admission: the runner pool executes untrusted commands, so
+    # it is held to the restricted profile. Phase 9 adds the granular
+    # securityContext, NetworkPolicy and ResourceQuota that enforce it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
