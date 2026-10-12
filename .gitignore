@@ -1,0 +1,5 @@
+bin/
+.dev/
+coverage.out
+*.test
+.DS_Store

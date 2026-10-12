@@ -1,0 +1,28 @@
+# kind cluster for kubedag local development.
+#
+# Single node, with extra port mappings so Redis/Postgres/API are reachable
+# from the host. The node-role label is irrelevant on a single-node cluster but
+# documents intent and survives a copy-paste into a multi-node variant.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubedag
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            # The runner pool scales pods horizontally; the default 110 pod
+            # limit is easy to hit during load tests in Phase 11.
+            max-pods: "200"
+    extraPortMappings:
+      - containerPort: 6379    # redis
+        hostPort: 6379
+        protocol: TCP
+      - containerPort: 5432    # postgres
+        hostPort: 5432
+        protocol: TCP
+      - containerPort: 8080    # orchestrator API
+        hostPort: 8080
+        protocol: TCP

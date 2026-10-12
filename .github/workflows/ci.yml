@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref: a force-push should not burn CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast feedback. If this fails there is no point burning a cluster.
+  static:
+    name: lint + typecheck + unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: unit tests (race)
+        run: go test ./... -race -count=1
+      - name: build
+        run: go build ./...
+
+  # Slower and cluster-dependent. Tagged so it can be required before merge
+  # without slowing every push during development.
+  integration:
+    name: integration (kind)
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+          cache: true
+
+      - name: install kind
+        run: |
+          curl -sLo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/
+
+      - name: build orchestrator image
+        run: |
+          docker build -t kubedag-runner:v0 -f deploy/runner/Dockerfile deploy/runner
+
+      - name: create cluster and deploy infra
+        run: |
+          ./scripts/dev-up.sh --infra-only
+
+      # Integration tests actually arrive in Phase 7 (crash recovery) and
+      # Phase 9 (security verification). The job exists now so that the
+      # cluster-provisioning path is proven continuously rather than
+      # discovered broken on the day we first need it.
+      - name: integration tests
+        run: |
+          echo "no integration tests yet (Phase 7); verifying stack instead"
+          kubectl -n kubedag get pods
+          kubectl -n kubedag wait --for=condition=Ready pod -l app.kubernetes.io/name=runner --timeout=180s
+
+      - name: dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n kubedag get pods -o wide || true
+          kubectl -n kubedag describe pods || true
+          kubectl -n kubedag logs -l app.kubernetes.io/name=runner --tail=200 || true
+
+      - name: teardown
+        if: always()
+        run: ./scripts/dev-down.sh || true
+
+  image:
+    name: container build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build runner image
+        run: docker build -t kubedag-runner:v0 -f deploy/runner/Dockerfile deploy/runner
+      - name: build orchestrator image
+        run: docker build -t kubedag-orchestrator:dev -f Dockerfile .
